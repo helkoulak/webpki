@@ -81,7 +81,8 @@ rpath = false
 name = "webpki"
 
 [dependencies.ring]
-version = "0.16.19"
+git = "https://github.com/helkoulak/ring"
+branch = "ring_tcpls"
 default-features = false
 
 [dependencies.untrusted]
