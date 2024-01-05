@@ -12,92 +12,174 @@
 // ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 // OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-use core::fmt::Write;
+#[cfg(feature = "alloc")]
+use alloc::string::String;
 
-use pki_types::{DnsName, InvalidDnsNameError};
+/// A DNS Name suitable for use in the TLS Server Name Indication (SNI)
+/// extension and/or for use as the reference hostname for which to verify a
+/// certificate.
+///
+/// A `DnsName` is guaranteed to be syntactically valid. The validity rules are
+/// specified in [RFC 5280 Section 7.2], except that underscores are also
+/// allowed.
+///
+/// `DnsName` stores a copy of the input it was constructed from in a `String`
+/// and so it is only available when the `std` default feature is enabled.
+///
+/// `Eq`, `PartialEq`, etc. are not implemented because name comparison
+/// frequently should be done case-insensitively and/or with other caveats that
+/// depend on the specific circumstances in which the comparison is done.
+///
+/// [RFC 5280 Section 7.2]: https://tools.ietf.org/html/rfc5280#section-7.2
+///
+/// Requires the `alloc` feature.
+#[cfg(feature = "alloc")]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct DnsName(String);
 
-use super::verify::{GeneralName, NameIterator};
-use crate::Error;
-
-pub(crate) fn verify_dns_names(
-    reference: &DnsName<'_>,
-    mut names: NameIterator<'_>,
-) -> Result<(), Error> {
-    let dns_name = untrusted::Input::from(reference.as_ref().as_bytes());
-    names
-        .find_map(|result| {
-            let name = match result {
-                Ok(name) => name,
-                Err(err) => return Some(Err(err)),
-            };
-
-            let presented_id = match name {
-                GeneralName::DnsName(presented) => presented,
-                _ => return None,
-            };
-
-            match presented_id_matches_reference_id(presented_id, IdRole::Reference, dns_name) {
-                Ok(true) => Some(Ok(())),
-                Ok(false) | Err(Error::MalformedDnsIdentifier) => None,
-                Err(e) => Some(Err(e)),
-            }
-        })
-        .unwrap_or(Err(Error::CertNotValidForName))
+/// Requires the `alloc` feature.
+#[cfg(feature = "alloc")]
+impl DnsName {
+    /// Returns a `DnsNameRef` that refers to this `DnsName`.
+    pub fn as_ref(&self) -> DnsNameRef {
+        DnsNameRef(self.0.as_bytes())
+    }
 }
 
-/// A reference to a DNS Name presented by a server that may include a wildcard.
+/// Requires the `alloc` feature.
+#[cfg(feature = "alloc")]
+impl AsRef<str> for DnsName {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+/// Requires the `alloc` feature.
+// Deprecated
+#[cfg(feature = "alloc")]
+impl From<DnsNameRef<'_>> for DnsName {
+    fn from(dns_name: DnsNameRef) -> Self {
+        dns_name.to_owned()
+    }
+}
+
+/// A reference to a DNS Name suitable for use in the TLS Server Name Indication
+/// (SNI) extension and/or for use as the reference hostname for which to verify
+/// a certificate.
 ///
-/// A `WildcardDnsNameRef` is guaranteed to be syntactically valid. The validity rules
+/// A `DnsNameRef` is guaranteed to be syntactically valid. The validity rules
 /// are specified in [RFC 5280 Section 7.2], except that underscores are also
 /// allowed.
 ///
-/// Additionally, while [RFC6125 Section 4.1] says that a wildcard label may be of the form
-/// `<x>*<y>.<DNSID>`, where `<x>` and/or `<y>` may be empty, we follow a stricter policy common
-/// to most validation libraries (e.g. NSS) and only accept wildcard labels that are exactly `*`.
+/// `Eq`, `PartialEq`, etc. are not implemented because name comparison
+/// frequently should be done case-insensitively and/or with other caveats that
+/// depend on the specific circumstances in which the comparison is done.
 ///
 /// [RFC 5280 Section 7.2]: https://tools.ietf.org/html/rfc5280#section-7.2
-/// [RFC 6125 Section 4.1]: https://www.rfc-editor.org/rfc/rfc6125#section-4.1
-#[derive(Clone, Copy, Eq, PartialEq, Hash)]
-pub(crate) struct WildcardDnsNameRef<'a>(&'a [u8]);
+#[derive(Clone, Copy)]
+pub struct DnsNameRef<'a>(pub(crate) &'a [u8]);
 
-impl<'a> WildcardDnsNameRef<'a> {
-    /// Constructs a `WildcardDnsNameRef` from the given input if the input is a
+impl AsRef<[u8]> for DnsNameRef<'_> {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.0
+    }
+}
+
+/// An error indicating that a `DnsNameRef` could not built because the input
+/// is not a syntactically-valid DNS Name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidDnsNameError;
+
+impl core::fmt::Display for InvalidDnsNameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+/// Requires the `std` feature.
+#[cfg(feature = "std")]
+impl ::std::error::Error for InvalidDnsNameError {}
+
+impl<'a> DnsNameRef<'a> {
+    /// Constructs a `DnsNameRef` from the given input if the input is a
     /// syntactically-valid DNS name.
-    pub(crate) fn try_from_ascii(dns_name: &'a [u8]) -> Result<Self, InvalidDnsNameError> {
-        if !is_valid_dns_id(
-            untrusted::Input::from(dns_name),
-            IdRole::Reference,
-            Wildcards::Allow,
-        ) {
+    pub fn try_from_ascii(dns_name: &'a [u8]) -> Result<Self, InvalidDnsNameError> {
+        if !is_valid_reference_dns_id(untrusted::Input::from(dns_name)) {
             return Err(InvalidDnsNameError);
         }
 
         Ok(Self(dns_name))
     }
 
-    /// Yields a reference to the DNS name as a `&str`.
-    pub(crate) fn as_str(&self) -> &'a str {
-        // The unwrap won't fail because a `WildcardDnsNameRef` is guaranteed to be ASCII and
-        // ASCII is a subset of UTF-8.
-        core::str::from_utf8(self.0).unwrap()
+    /// Constructs a `DnsNameRef` from the given input if the input is a
+    /// syntactically-valid DNS name.
+    pub fn try_from_ascii_str(dns_name: &'a str) -> Result<Self, InvalidDnsNameError> {
+        Self::try_from_ascii(dns_name.as_bytes())
+    }
+
+    /// Constructs a `DnsName` from this `DnsNameRef`
+    ///
+    /// Requires the `alloc` feature.
+    #[cfg(feature = "alloc")]
+    pub fn to_owned(&self) -> DnsName {
+        // DnsNameRef is already guaranteed to be valid ASCII, which is a
+        // subset of UTF-8.
+        let s: &str = (*self).into();
+        DnsName(s.to_ascii_lowercase())
     }
 }
 
-impl core::fmt::Debug for WildcardDnsNameRef<'_> {
+/// Requires the `alloc` feature.
+#[cfg(feature = "alloc")]
+impl core::fmt::Debug for DnsNameRef<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> Result<(), core::fmt::Error> {
-        f.write_str("WildcardDnsNameRef(\"")?;
-
-        // Convert each byte of the underlying ASCII string to a `char` and
-        // downcase it prior to formatting it. We avoid self.to_owned() since
-        // it requires allocation.
-        for &ch in self.0 {
-            f.write_char(char::from(ch).to_ascii_lowercase())?;
-        }
-
-        f.write_str("\")")
+        let lowercase = self.clone().to_owned();
+        f.debug_tuple("DnsNameRef").field(&lowercase.0).finish()
     }
 }
 
+#[cfg(not(feature = "alloc"))]
+impl core::fmt::Debug for DnsNameRef<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> Result<(), core::fmt::Error> {
+        f.debug_tuple("DnsNameRef").field(&self.0).finish()
+    }
+}
+
+impl<'a> From<DnsNameRef<'a>> for &'a str {
+    fn from(DnsNameRef(d): DnsNameRef<'a>) -> Self {
+        // The unwrap won't fail because DnsNameRefs are guaranteed to be ASCII
+        // and ASCII is a subset of UTF-8.
+        core::str::from_utf8(d).unwrap()
+    }
+}
+
+pub(super) fn presented_id_matches_reference_id(
+    presented_dns_id: untrusted::Input,
+    reference_dns_id: untrusted::Input,
+) -> Option<bool> {
+    presented_id_matches_reference_id_internal(
+        presented_dns_id,
+        IdRole::Reference,
+        reference_dns_id,
+    )
+}
+
+pub(super) fn presented_id_matches_constraint(
+    presented_dns_id: untrusted::Input,
+    reference_dns_id: untrusted::Input,
+) -> Option<bool> {
+    presented_id_matches_reference_id_internal(
+        presented_dns_id,
+        IdRole::NameConstraint,
+        reference_dns_id,
+    )
+}
+
+// We do not distinguish between a syntactically-invalid presented_dns_id and
+// one that is syntactically valid but does not match reference_dns_id; in both
+// cases, the result is false.
+//
 // We assume that both presented_dns_id and reference_dns_id are encoded in
 // such a way that US-ASCII (7-bit) characters are encoded in one byte and no
 // encoding of a non-US-ASCII character contains a code point in the range
@@ -214,20 +296,17 @@ impl core::fmt::Debug for WildcardDnsNameRef<'_> {
 // [4] Feedback on the lack of clarify in the definition that never got
 //     incorporated into the spec:
 //     https://www.ietf.org/mail-archive/web/pkix/current/msg21192.html
-pub(super) fn presented_id_matches_reference_id(
+fn presented_id_matches_reference_id_internal(
     presented_dns_id: untrusted::Input,
     reference_dns_id_role: IdRole,
     reference_dns_id: untrusted::Input,
-) -> Result<bool, Error> {
-    if !is_valid_dns_id(presented_dns_id, IdRole::Presented, Wildcards::Allow) {
-        return Err(Error::MalformedDnsIdentifier);
+) -> Option<bool> {
+    if !is_valid_dns_id(presented_dns_id, IdRole::Presented, AllowWildcards::Yes) {
+        return None;
     }
 
-    if !is_valid_dns_id(reference_dns_id, reference_dns_id_role, Wildcards::Deny) {
-        return Err(match reference_dns_id_role {
-            IdRole::NameConstraint => Error::MalformedNameConstraint,
-            _ => Error::MalformedDnsIdentifier,
-        });
+    if !is_valid_dns_id(reference_dns_id, reference_dns_id_role, AllowWildcards::No) {
+        return None;
     }
 
     let mut presented = untrusted::Reader::new(presented_dns_id);
@@ -239,7 +318,7 @@ pub(super) fn presented_id_matches_reference_id(
         IdRole::NameConstraint if presented_dns_id.len() > reference_dns_id.len() => {
             if reference_dns_id.is_empty() {
                 // An empty constraint matches everything.
-                return Ok(true);
+                return Some(true);
             }
 
             // If the reference ID starts with a dot then skip the prefix of
@@ -280,7 +359,7 @@ pub(super) fn presented_id_matches_reference_id(
                     unreachable!();
                 }
                 if presented.read_byte() != Ok(b'.') {
-                    return Ok(false);
+                    return Some(false);
                 }
             }
         }
@@ -298,7 +377,7 @@ pub(super) fn presented_id_matches_reference_id(
 
         loop {
             if reference.read_byte().is_err() {
-                return Ok(false);
+                return Some(false);
             }
             if reference.peek(b'.') {
                 break;
@@ -310,14 +389,14 @@ pub(super) fn presented_id_matches_reference_id(
         let presented_byte = match (presented.read_byte(), reference.read_byte()) {
             (Ok(p), Ok(r)) if ascii_lower(p) == ascii_lower(r) => p,
             _ => {
-                return Ok(false);
+                return Some(false);
             }
         };
 
         if presented.at_end() {
             // Don't allow presented IDs to be absolute.
             if presented_byte == b'.' {
-                return Err(Error::MalformedDnsIdentifier);
+                return None;
             }
             break;
         }
@@ -330,19 +409,19 @@ pub(super) fn presented_id_matches_reference_id(
             match reference.read_byte() {
                 Ok(b'.') => (),
                 _ => {
-                    return Ok(false);
+                    return Some(false);
                 }
             };
         }
         if !reference.at_end() {
-            return Ok(false);
+            return Some(false);
         }
     }
 
     assert!(presented.at_end());
     assert!(reference.at_end());
 
-    Ok(true)
+    Some(true)
 }
 
 #[inline]
@@ -354,16 +433,20 @@ fn ascii_lower(b: u8) -> u8 {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Wildcards {
-    Deny,
-    Allow,
+enum AllowWildcards {
+    No,
+    Yes,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub(super) enum IdRole {
+enum IdRole {
     Reference,
     Presented,
     NameConstraint,
+}
+
+fn is_valid_reference_dns_id(hostname: untrusted::Input) -> bool {
+    is_valid_dns_id(hostname, IdRole::Reference, AllowWildcards::No)
 }
 
 // https://tools.ietf.org/html/rfc5280#section-4.2.1.6:
@@ -379,7 +462,7 @@ pub(super) enum IdRole {
 fn is_valid_dns_id(
     hostname: untrusted::Input,
     id_role: IdRole,
-    allow_wildcards: Wildcards,
+    allow_wildcards: AllowWildcards,
 ) -> bool {
     // https://blogs.msdn.microsoft.com/oldnewthing/20120412-00/?p=7873/
     if hostname.len() > 253 {
@@ -400,7 +483,7 @@ fn is_valid_dns_id(
     // Only presented IDs are allowed to have wildcard labels. And, like
     // Chromium, be stricter than RFC 6125 requires by insisting that a
     // wildcard label consist only of '*'.
-    let is_wildcard = allow_wildcards == Wildcards::Allow && input.peek(b'*');
+    let is_wildcard = allow_wildcards == AllowWildcards::Yes && input.peek(b'*');
     let mut is_first_byte = !is_wildcard;
     if is_wildcard {
         if input.read_byte() != Ok(b'*') || input.read_byte() != Ok(b'.') {
@@ -505,365 +588,200 @@ fn is_valid_dns_id(
 mod tests {
     use super::*;
 
-    #[allow(clippy::type_complexity)]
-    const PRESENTED_MATCHES_REFERENCE: &[(&[u8], &[u8], Result<bool, Error>)] = &[
-        (b"", b"a", Err(Error::MalformedDnsIdentifier)),
-        (b"a", b"a", Ok(true)),
-        (b"b", b"a", Ok(false)),
-        (b"*.b.a", b"c.b.a", Ok(true)),
-        (b"*.b.a", b"b.a", Ok(false)),
-        (b"*.b.a", b"b.a.", Ok(false)),
+    const PRESENTED_MATCHES_REFERENCE: &[(&[u8], &[u8], Option<bool>)] = &[
+        (b"", b"a", None),
+        (b"a", b"a", Some(true)),
+        (b"b", b"a", Some(false)),
+        (b"*.b.a", b"c.b.a", Some(true)),
+        (b"*.b.a", b"b.a", Some(false)),
+        (b"*.b.a", b"b.a.", Some(false)),
         // Wildcard not in leftmost label
-        (b"d.c.b.a", b"d.c.b.a", Ok(true)),
-        (b"d.*.b.a", b"d.c.b.a", Err(Error::MalformedDnsIdentifier)),
-        (b"d.c*.b.a", b"d.c.b.a", Err(Error::MalformedDnsIdentifier)),
-        (b"d.c*.b.a", b"d.cc.b.a", Err(Error::MalformedDnsIdentifier)),
+        (b"d.c.b.a", b"d.c.b.a", Some(true)),
+        (b"d.*.b.a", b"d.c.b.a", None),
+        (b"d.c*.b.a", b"d.c.b.a", None),
+        (b"d.c*.b.a", b"d.cc.b.a", None),
         // case sensitivity
         (
             b"abcdefghijklmnopqrstuvwxyz",
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-            Ok(true),
+            Some(true),
         ),
         (
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
             b"abcdefghijklmnopqrstuvwxyz",
-            Ok(true),
+            Some(true),
         ),
-        (b"aBc", b"Abc", Ok(true)),
+        (b"aBc", b"Abc", Some(true)),
         // digits
-        (b"a1", b"a1", Ok(true)),
+        (b"a1", b"a1", Some(true)),
         // A trailing dot indicates an absolute name, and absolute names can match
         // relative names, and vice-versa.
-        (b"example", b"example", Ok(true)),
-        (b"example.", b"example.", Err(Error::MalformedDnsIdentifier)),
-        (b"example", b"example.", Ok(true)),
-        (b"example.", b"example", Err(Error::MalformedDnsIdentifier)),
-        (b"example.com", b"example.com", Ok(true)),
-        (
-            b"example.com.",
-            b"example.com.",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (b"example.com", b"example.com.", Ok(true)),
-        (
-            b"example.com.",
-            b"example.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"example.com..",
-            b"example.com.",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"example.com..",
-            b"example.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"example.com...",
-            b"example.com.",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b"example", b"example", Some(true)),
+        (b"example.", b"example.", None),
+        (b"example", b"example.", Some(true)),
+        (b"example.", b"example", None),
+        (b"example.com", b"example.com", Some(true)),
+        (b"example.com.", b"example.com.", None),
+        (b"example.com", b"example.com.", Some(true)),
+        (b"example.com.", b"example.com", None),
+        (b"example.com..", b"example.com.", None),
+        (b"example.com..", b"example.com", None),
+        (b"example.com...", b"example.com.", None),
         // xn-- IDN prefix
-        (b"x*.b.a", b"xa.b.a", Err(Error::MalformedDnsIdentifier)),
-        (b"x*.b.a", b"xna.b.a", Err(Error::MalformedDnsIdentifier)),
-        (b"x*.b.a", b"xn-a.b.a", Err(Error::MalformedDnsIdentifier)),
-        (b"x*.b.a", b"xn--a.b.a", Err(Error::MalformedDnsIdentifier)),
-        (b"xn*.b.a", b"xn--a.b.a", Err(Error::MalformedDnsIdentifier)),
-        (
-            b"xn-*.b.a",
-            b"xn--a.b.a",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"xn--*.b.a",
-            b"xn--a.b.a",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (b"xn*.b.a", b"xn--a.b.a", Err(Error::MalformedDnsIdentifier)),
-        (
-            b"xn-*.b.a",
-            b"xn--a.b.a",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"xn--*.b.a",
-            b"xn--a.b.a",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"xn---*.b.a",
-            b"xn--a.b.a",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b"x*.b.a", b"xa.b.a", None),
+        (b"x*.b.a", b"xna.b.a", None),
+        (b"x*.b.a", b"xn-a.b.a", None),
+        (b"x*.b.a", b"xn--a.b.a", None),
+        (b"xn*.b.a", b"xn--a.b.a", None),
+        (b"xn-*.b.a", b"xn--a.b.a", None),
+        (b"xn--*.b.a", b"xn--a.b.a", None),
+        (b"xn*.b.a", b"xn--a.b.a", None),
+        (b"xn-*.b.a", b"xn--a.b.a", None),
+        (b"xn--*.b.a", b"xn--a.b.a", None),
+        (b"xn---*.b.a", b"xn--a.b.a", None),
         // "*" cannot expand to nothing.
-        (b"c*.b.a", b"c.b.a", Err(Error::MalformedDnsIdentifier)),
+        (b"c*.b.a", b"c.b.a", None),
         // --------------------------------------------------------------------------
         // The rest of these are test cases adapted from Chromium's
         // x509_certificate_unittest.cc. The parameter order is the opposite in
-        // Chromium's tests. Also, they Ok tests were modified to fit into this
+        // Chromium's tests. Also, they some tests were modified to fit into this
         // framework or due to intentional differences between mozilla::pkix and
         // Chromium.
-        (b"foo.com", b"foo.com", Ok(true)),
-        (b"f", b"f", Ok(true)),
-        (b"i", b"h", Ok(false)),
-        (b"*.foo.com", b"bar.foo.com", Ok(true)),
-        (b"*.test.fr", b"www.test.fr", Ok(true)),
-        (b"*.test.FR", b"wwW.tESt.fr", Ok(true)),
-        (b".uk", b"f.uk", Err(Error::MalformedDnsIdentifier)),
-        (
-            b"?.bar.foo.com",
-            b"w.bar.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"(www|ftp).foo.com",
-            b"www.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ), // regex!
-        (
-            b"www.foo.com\0",
-            b"www.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"www.foo.com\0*.foo.com",
-            b"www.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (b"ww.house.example", b"www.house.example", Ok(false)),
-        (b"www.test.org", b"test.org", Ok(false)),
-        (b"*.test.org", b"test.org", Ok(false)),
-        (b"*.org", b"test.org", Err(Error::MalformedDnsIdentifier)),
+        (b"foo.com", b"foo.com", Some(true)),
+        (b"f", b"f", Some(true)),
+        (b"i", b"h", Some(false)),
+        (b"*.foo.com", b"bar.foo.com", Some(true)),
+        (b"*.test.fr", b"www.test.fr", Some(true)),
+        (b"*.test.FR", b"wwW.tESt.fr", Some(true)),
+        (b".uk", b"f.uk", None),
+        (b"?.bar.foo.com", b"w.bar.foo.com", None),
+        (b"(www|ftp).foo.com", b"www.foo.com", None), // regex!
+        (b"www.foo.com\0", b"www.foo.com", None),
+        (b"www.foo.com\0*.foo.com", b"www.foo.com", None),
+        (b"ww.house.example", b"www.house.example", Some(false)),
+        (b"www.test.org", b"test.org", Some(false)),
+        (b"*.test.org", b"test.org", Some(false)),
+        (b"*.org", b"test.org", None),
         // '*' must be the only character in the wildcard label
-        (
-            b"w*.bar.foo.com",
-            b"w.bar.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"ww*ww.bar.foo.com",
-            b"www.bar.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"ww*ww.bar.foo.com",
-            b"wwww.bar.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"w*w.bar.foo.com",
-            b"wwww.bar.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"w*w.bar.foo.c0m",
-            b"wwww.bar.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"wa*.bar.foo.com",
-            b"WALLY.bar.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"*Ly.bar.foo.com",
-            b"wally.bar.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b"w*.bar.foo.com", b"w.bar.foo.com", None),
+        (b"ww*ww.bar.foo.com", b"www.bar.foo.com", None),
+        (b"ww*ww.bar.foo.com", b"wwww.bar.foo.com", None),
+        (b"w*w.bar.foo.com", b"wwww.bar.foo.com", None),
+        (b"w*w.bar.foo.c0m", b"wwww.bar.foo.com", None),
+        (b"wa*.bar.foo.com", b"WALLY.bar.foo.com", None),
+        (b"*Ly.bar.foo.com", b"wally.bar.foo.com", None),
         // Chromium does URL decoding of the reference ID, but we don't, and we also
         // require that the reference ID is valid, so we can't test these two.
-        //     (b"www.foo.com", b"ww%57.foo.com", Ok(true)),
-        //     (b"www&.foo.com", b"www%26.foo.com", Ok(true)),
-        (b"*.test.de", b"www.test.co.jp", Ok(false)),
-        (
-            b"*.jp",
-            b"www.test.co.jp",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (b"www.test.co.uk", b"www.test.co.jp", Ok(false)),
-        (
-            b"www.*.co.jp",
-            b"www.test.co.jp",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (b"www.bar.foo.com", b"www.bar.foo.com", Ok(true)),
-        (b"*.foo.com", b"www.bar.foo.com", Ok(false)),
-        (
-            b"*.*.foo.com",
-            b"www.bar.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        //     (b"www.foo.com", b"ww%57.foo.com", Some(true)),
+        //     (b"www&.foo.com", b"www%26.foo.com", Some(true)),
+        (b"*.test.de", b"www.test.co.jp", Some(false)),
+        (b"*.jp", b"www.test.co.jp", None),
+        (b"www.test.co.uk", b"www.test.co.jp", Some(false)),
+        (b"www.*.co.jp", b"www.test.co.jp", None),
+        (b"www.bar.foo.com", b"www.bar.foo.com", Some(true)),
+        (b"*.foo.com", b"www.bar.foo.com", Some(false)),
+        (b"*.*.foo.com", b"www.bar.foo.com", None),
         // Our matcher requires the reference ID to be a valid DNS name, so we cannot
         // test this case.
-        //     (b"*.*.bar.foo.com", b"*..bar.foo.com", Ok(false)),
-        (b"www.bath.org", b"www.bath.org", Ok(true)),
+        //     (b"*.*.bar.foo.com", b"*..bar.foo.com", Some(false)),
+        (b"www.bath.org", b"www.bath.org", Some(true)),
         // Our matcher requires the reference ID to be a valid DNS name, so we cannot
         // test these cases.
         // DNS_ID_MISMATCH("www.bath.org", ""),
-        //     (b"www.bath.org", b"20.30.40.50", Ok(false)),
-        //     (b"www.bath.org", b"66.77.88.99", Ok(false)),
+        //     (b"www.bath.org", b"20.30.40.50", Some(false)),
+        //     (b"www.bath.org", b"66.77.88.99", Some(false)),
 
         // IDN tests
         (
             b"xn--poema-9qae5a.com.br",
             b"xn--poema-9qae5a.com.br",
-            Ok(true),
+            Some(true),
         ),
         (
             b"*.xn--poema-9qae5a.com.br",
             b"www.xn--poema-9qae5a.com.br",
-            Ok(true),
+            Some(true),
         ),
         (
             b"*.xn--poema-9qae5a.com.br",
             b"xn--poema-9qae5a.com.br",
-            Ok(false),
+            Some(false),
         ),
-        (
-            b"xn--poema-*.com.br",
-            b"xn--poema-9qae5a.com.br",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"xn--*-9qae5a.com.br",
-            b"xn--poema-9qae5a.com.br",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"*--poema-9qae5a.com.br",
-            b"xn--poema-9qae5a.com.br",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b"xn--poema-*.com.br", b"xn--poema-9qae5a.com.br", None),
+        (b"xn--*-9qae5a.com.br", b"xn--poema-9qae5a.com.br", None),
+        (b"*--poema-9qae5a.com.br", b"xn--poema-9qae5a.com.br", None),
         // The following are adapted from the examples quoted from
         //   http://tools.ietf.org/html/rfc6125#section-6.4.3
         // (e.g., *.example.com would match foo.example.com but
         // not bar.foo.example.com or example.com).
-        (b"*.example.com", b"foo.example.com", Ok(true)),
-        (b"*.example.com", b"bar.foo.example.com", Ok(false)),
-        (b"*.example.com", b"example.com", Ok(false)),
-        (
-            b"baz*.example.net",
-            b"baz1.example.net",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"*baz.example.net",
-            b"foobaz.example.net",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"b*z.example.net",
-            b"buzz.example.net",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b"*.example.com", b"foo.example.com", Some(true)),
+        (b"*.example.com", b"bar.foo.example.com", Some(false)),
+        (b"*.example.com", b"example.com", Some(false)),
+        (b"baz*.example.net", b"baz1.example.net", None),
+        (b"*baz.example.net", b"foobaz.example.net", None),
+        (b"b*z.example.net", b"buzz.example.net", None),
         // Wildcards should not be valid for public registry controlled domains,
         // and unknown/unrecognized domains, at least three domain components must
         // be present. For mozilla::pkix and NSS, there must always be at least two
         // labels after the wildcard label.
-        (b"*.test.example", b"www.test.example", Ok(true)),
-        (b"*.example.co.uk", b"test.example.co.uk", Ok(true)),
-        (
-            b"*.example",
-            b"test.example",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b"*.test.example", b"www.test.example", Some(true)),
+        (b"*.example.co.uk", b"test.example.co.uk", Some(true)),
+        (b"*.example", b"test.example", None),
         // The result is different than Chromium, because Chromium takes into account
         // the additional knowledge it has that "co.uk" is a TLD. mozilla::pkix does
         // not know that.
-        (b"*.co.uk", b"example.co.uk", Ok(true)),
-        (b"*.com", b"foo.com", Err(Error::MalformedDnsIdentifier)),
-        (b"*.us", b"foo.us", Err(Error::MalformedDnsIdentifier)),
-        (b"*", b"foo", Err(Error::MalformedDnsIdentifier)),
+        (b"*.co.uk", b"example.co.uk", Some(true)),
+        (b"*.com", b"foo.com", None),
+        (b"*.us", b"foo.us", None),
+        (b"*", b"foo", None),
         // IDN variants of wildcards and registry controlled domains.
         (
             b"*.xn--poema-9qae5a.com.br",
             b"www.xn--poema-9qae5a.com.br",
-            Ok(true),
+            Some(true),
         ),
         (
             b"*.example.xn--mgbaam7a8h",
             b"test.example.xn--mgbaam7a8h",
-            Ok(true),
+            Some(true),
         ),
         // RFC6126 allows this, and NSS accepts it, but Chromium disallows it.
         // TODO: File bug against Chromium.
-        (b"*.com.br", b"xn--poema-9qae5a.com.br", Ok(true)),
-        (
-            b"*.xn--mgbaam7a8h",
-            b"example.xn--mgbaam7a8h",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b"*.com.br", b"xn--poema-9qae5a.com.br", Some(true)),
+        (b"*.xn--mgbaam7a8h", b"example.xn--mgbaam7a8h", None),
         // Wildcards should be permissible for 'private' registry-controlled
         // domains. (In mozilla::pkix, we do not know if it is a private registry-
         // controlled domain or not.)
-        (b"*.appspot.com", b"www.appspot.com", Ok(true)),
-        (b"*.s3.amazonaws.com", b"foo.s3.amazonaws.com", Ok(true)),
+        (b"*.appspot.com", b"www.appspot.com", Some(true)),
+        (b"*.s3.amazonaws.com", b"foo.s3.amazonaws.com", Some(true)),
         // Multiple wildcards are not valid.
-        (
-            b"*.*.com",
-            b"foo.example.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"*.bar.*.com",
-            b"foo.bar.example.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b"*.*.com", b"foo.example.com", None),
+        (b"*.bar.*.com", b"foo.bar.example.com", None),
         // Absolute vs relative DNS name tests. Although not explicitly specified
         // in RFC 6125, absolute reference names (those ending in a .) should
         // match either absolute or relative presented names.
         // TODO: File errata against RFC 6125 about this.
-        (b"foo.com.", b"foo.com", Err(Error::MalformedDnsIdentifier)),
-        (b"foo.com", b"foo.com.", Ok(true)),
-        (b"foo.com.", b"foo.com.", Err(Error::MalformedDnsIdentifier)),
-        (b"f.", b"f", Err(Error::MalformedDnsIdentifier)),
-        (b"f", b"f.", Ok(true)),
-        (b"f.", b"f.", Err(Error::MalformedDnsIdentifier)),
-        (
-            b"*.bar.foo.com.",
-            b"www-3.bar.foo.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (b"*.bar.foo.com", b"www-3.bar.foo.com.", Ok(true)),
-        (
-            b"*.bar.foo.com.",
-            b"www-3.bar.foo.com.",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b"foo.com.", b"foo.com", None),
+        (b"foo.com", b"foo.com.", Some(true)),
+        (b"foo.com.", b"foo.com.", None),
+        (b"f.", b"f", None),
+        (b"f", b"f.", Some(true)),
+        (b"f.", b"f.", None),
+        (b"*.bar.foo.com.", b"www-3.bar.foo.com", None),
+        (b"*.bar.foo.com", b"www-3.bar.foo.com.", Some(true)),
+        (b"*.bar.foo.com.", b"www-3.bar.foo.com.", None),
         // We require the reference ID to be a valid DNS name, so we cannot test this
         // case.
-        //     (b".", b".", Ok(false)),
-        (
-            b"*.com.",
-            b"example.com",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"*.com",
-            b"example.com.",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"*.com.",
-            b"example.com.",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (b"*.", b"foo.", Err(Error::MalformedDnsIdentifier)),
-        (b"*.", b"foo", Err(Error::MalformedDnsIdentifier)),
+        //     (b".", b".", Some(false)),
+        (b"*.com.", b"example.com", None),
+        (b"*.com", b"example.com.", None),
+        (b"*.com.", b"example.com.", None),
+        (b"*.", b"foo.", None),
+        (b"*.", b"foo", None),
         // The result is different than Chromium because we don't know that co.uk is
         // a TLD.
-        (
-            b"*.co.uk.",
-            b"foo.co.uk",
-            Err(Error::MalformedDnsIdentifier),
-        ),
-        (
-            b"*.co.uk.",
-            b"foo.co.uk.",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b"*.co.uk.", b"foo.co.uk", None),
+        (b"*.co.uk.", b"foo.co.uk.", None),
     ];
 
     #[test]
@@ -871,7 +789,6 @@ mod tests {
         for &(presented, reference, expected_result) in PRESENTED_MATCHES_REFERENCE {
             let actual_result = presented_id_matches_reference_id(
                 untrusted::Input::from(presented),
-                IdRole::Reference,
                 untrusted::Input::from(reference),
             );
             assert_eq!(
@@ -883,78 +800,60 @@ mod tests {
     }
 
     // (presented_name, constraint, expected_matches)
-    #[allow(clippy::type_complexity)]
-    const PRESENTED_MATCHES_CONSTRAINT: &[(&[u8], &[u8], Result<bool, Error>)] = &[
+    const PRESENTED_MATCHES_CONSTRAINT: &[(&[u8], &[u8], Option<bool>)] = &[
         // No absolute presented IDs allowed
-        (b".", b"", Err(Error::MalformedDnsIdentifier)),
-        (b"www.example.com.", b"", Err(Error::MalformedDnsIdentifier)),
-        (
-            b"www.example.com.",
-            b"www.example.com.",
-            Err(Error::MalformedDnsIdentifier),
-        ),
+        (b".", b"", None),
+        (b"www.example.com.", b"", None),
+        (b"www.example.com.", b"www.example.com.", None),
         // No absolute constraints allowed
-        (
-            b"www.example.com",
-            b".",
-            Err(Error::MalformedNameConstraint),
-        ),
-        (
-            b"www.example.com",
-            b"www.example.com.",
-            Err(Error::MalformedNameConstraint),
-        ),
+        (b"www.example.com", b".", None),
+        (b"www.example.com", b"www.example.com.", None),
         // No wildcard in constraints allowed
-        (
-            b"www.example.com",
-            b"*.example.com",
-            Err(Error::MalformedNameConstraint),
-        ),
+        (b"www.example.com", b"*.example.com", None),
         // No empty presented IDs allowed
-        (b"", b"", Err(Error::MalformedDnsIdentifier)),
+        (b"", b"", None),
         // Empty constraints match everything allowed
-        (b"example.com", b"", Ok(true)),
-        (b"*.example.com", b"", Ok(true)),
+        (b"example.com", b"", Some(true)),
+        (b"*.example.com", b"", Some(true)),
         // Constraints that start with a dot
-        (b"www.example.com", b".example.com", Ok(true)),
-        (b"www.example.com", b".EXAMPLE.COM", Ok(true)),
-        (b"www.example.com", b".axample.com", Ok(false)),
-        (b"www.example.com", b".xample.com", Ok(false)),
-        (b"www.example.com", b".exampl.com", Ok(false)),
-        (b"badexample.com", b".example.com", Ok(false)),
+        (b"www.example.com", b".example.com", Some(true)),
+        (b"www.example.com", b".EXAMPLE.COM", Some(true)),
+        (b"www.example.com", b".axample.com", Some(false)),
+        (b"www.example.com", b".xample.com", Some(false)),
+        (b"www.example.com", b".exampl.com", Some(false)),
+        (b"badexample.com", b".example.com", Some(false)),
         // Constraints that do not start with a dot
-        (b"www.example.com", b"example.com", Ok(true)),
-        (b"www.example.com", b"EXAMPLE.COM", Ok(true)),
-        (b"www.example.com", b"axample.com", Ok(false)),
-        (b"www.example.com", b"xample.com", Ok(false)),
-        (b"www.example.com", b"exampl.com", Ok(false)),
-        (b"badexample.com", b"example.com", Ok(false)),
+        (b"www.example.com", b"example.com", Some(true)),
+        (b"www.example.com", b"EXAMPLE.COM", Some(true)),
+        (b"www.example.com", b"axample.com", Some(false)),
+        (b"www.example.com", b"xample.com", Some(false)),
+        (b"www.example.com", b"exampl.com", Some(false)),
+        (b"badexample.com", b"example.com", Some(false)),
         // Presented IDs with wildcard
-        (b"*.example.com", b".example.com", Ok(true)),
-        (b"*.example.com", b"example.com", Ok(true)),
-        (b"*.example.com", b"www.example.com", Ok(true)),
-        (b"*.example.com", b"www.EXAMPLE.COM", Ok(true)),
-        (b"*.example.com", b"www.axample.com", Ok(false)),
-        (b"*.example.com", b".xample.com", Ok(false)),
-        (b"*.example.com", b"xample.com", Ok(false)),
-        (b"*.example.com", b".exampl.com", Ok(false)),
-        (b"*.example.com", b"exampl.com", Ok(false)),
+        (b"*.example.com", b".example.com", Some(true)),
+        (b"*.example.com", b"example.com", Some(true)),
+        (b"*.example.com", b"www.example.com", Some(true)),
+        (b"*.example.com", b"www.EXAMPLE.COM", Some(true)),
+        (b"*.example.com", b"www.axample.com", Some(false)),
+        (b"*.example.com", b".xample.com", Some(false)),
+        (b"*.example.com", b"xample.com", Some(false)),
+        (b"*.example.com", b".exampl.com", Some(false)),
+        (b"*.example.com", b"exampl.com", Some(false)),
         // Matching IDs
-        (b"www.example.com", b"www.example.com", Ok(true)),
+        (b"www.example.com", b"www.example.com", Some(true)),
     ];
 
     #[test]
     fn presented_matches_constraint_test() {
         for &(presented, constraint, expected_result) in PRESENTED_MATCHES_CONSTRAINT {
-            let actual_result = presented_id_matches_reference_id(
+            let actual_result = presented_id_matches_constraint(
                 untrusted::Input::from(presented),
-                IdRole::NameConstraint,
                 untrusted::Input::from(constraint),
             );
             assert_eq!(
                 actual_result, expected_result,
                 "presented_id_matches_constraint(\"{:?}\", \"{:?}\")",
-                presented, constraint,
+                presented, constraint
             );
         }
     }
